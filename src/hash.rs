@@ -42,6 +42,8 @@ impl<H: HashFunction> Accumulator<H> {
 
     #[inline]
     pub fn add(&mut self, bts: &[u8]) -> &mut Self {
+        let blen = (bts.len() as u64).to_be_bytes();
+        self.accum.extend_from_slice(&blen);
         self.accum.extend_from_slice(bts);
         self
     }
