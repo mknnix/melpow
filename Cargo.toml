@@ -3,6 +3,10 @@ name = "melpow"
 version = "0.1.0"
 edition = "2021"
 
+description = "Core state-transition function and data structures for Themelio"
+license = "MPL-2.0"
+repository = "https://github.com/themeliolabs/melpow"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
