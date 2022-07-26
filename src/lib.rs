@@ -7,9 +7,13 @@ mod node;
 pub use crate::node::SVec;
 pub use hash::HashFunction;
 
-use std::{convert::TryInto, sync::Arc};
+use std::{convert::TryInto, sync::Arc, time::Instant};
 
 use rustc_hash::FxHashMap;
+
+use {bincode, serde};
+use serde::{Serialize, Deserialize};
+use anyhow;
 
 const PROOF_CERTAINTY: usize = 200;
 
@@ -17,12 +21,139 @@ const PROOF_CERTAINTY: usize = 200;
 /// A MelPoW proof with an opaque representation that is guaranteed to be stable. It can be cloned relatively cheaply because it's internally reference counted.
 pub struct Proof(Arc<FxHashMap<node::Node, SVec<u8>>>);
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Represents a proof generating in progress, it will return a Proof if the work has completed
+pub struct ProofUnderProgress
+{
+    proof_map: Arc<FxHashMap< node::Node, SVec<u8> >>,
+    chi: SVec<u8>,
+    gammas: Vec<node::Node>,
+    total_count: f64,
+    current_count: f64,
+    //nd: 'unk',
+    //lab: 'unk',
+
+    puzzle: Vec<u8>,
+    difficulty: usize,
+
+    TICK_SECS: usize, // const in the lifetime of a instance, do not modify it once constructed.
+    tick_secs_override: Option<usize>,
+    ticks: u64, // a tick counter
+
+    finish: bool,
+    proof: Option<Proof>,
+
+    hasher: HashFunction,
+}
+
+impl ProofUnderProgress {
+    /// initial a new blank mint progress.
+    pub fn init(puzzle: &[u8], difficulty: usize, hasher: impl HashFunction) -> Self {
+        let proof_map = Arc::new( FxHashMap::default() );
+        let chi = hash::bts_key(puzzle, b"chi");
+
+        let gammas = gen_gammas(puzzle, difficulty);
+        gammas.into_iter().for_each(|gamma| {
+            gamma_to_path(gamma).into_iter().for_each(|pn| {
+                proof_map.insert(pn, SVec::new());
+            });
+
+            proof_map.insert(gamma, SVec::new());
+        });
+
+        let total_count = 2.0f64.powi(difficulty as _);
+        let current_count = 0.0;
+
+        Self {
+            puzzle: puzzle.to_vec(),
+            difficulty,
+            proof_map,
+            chi,
+            gammas,
+            total_count,
+            current_count,
+            hasher,
+
+            TICK_SECS: Self::default_tick(),
+            tick_secs_override: None,
+
+            finish: false,
+            ticks: 0,
+
+            proof: None,
+        }
+    }
+
+    // to execute next generating until $tick seconds later.
+    // if finish, return a Proof object, or None
+    pub fn next(&mut self) -> Option<Proof> {
+        if self.finish {
+            return Some( self.generate_proof() );
+        }
+
+        let start = Instant::now();
+        let tick = self.get_tick();
+        while start.elapsed().as_secs() < tick {
+            self.do_progressing();
+            if self.finish { break; }
+        }
+        self.ticks += 1;
+
+        if self.finish { return self.next(); }
+
+        None
+    }
+
+    /// the core handle function for the progress of generating proof. do not pub it unless you expect others to violate the tick interval.
+    /// the number of executes is fixed to 100,000 ops (unless it will be returned earlier when the progress completed)
+    /// ** make sure the .finish field only set by this function **
+    fn do_progressing(&mut self) {
+        todo!()
+    }
+    /// generate the proof. this method should be call with The Final State, otherwise it will got you an unwanted result
+    pub fn generate_proof(&mut self) -> Proof {
+        if ! self.finish {
+            panic!("do not call this with still in progressing...");
+        }
+
+        if let Some(proof) = self.proof {
+            return proof;
+        }
+
+        let proof = todo!();
+
+        self.proof = Some(proof);
+        proof
+    }
+
+    /// default tick value is read-only for everyone (don't modify unless you have a good idea)
+    pub fn default_tick() -> usize { 30 }
+
+    /// get the time-split interval, return the default value if no any override
+    pub fn get_tick(&self) -> usize {
+        if let Some(tick) = self.tick_secs_override {
+            return tick;
+        }
+
+        self.TICK_SECS
+    }
+    /// specify a tick value to replace the default... returns True if success
+    pub fn override_tick(&mut self, tick: usize) -> bool {
+        // refused to override again
+        if let Some(_) = self.tick_secs_override {
+            return false;
+        }
+
+        self.tick_secs_override = Some(tick);
+        return true;
+    }
+}
+
 impl Proof {
     /// Generates a MelPoW proof with respect to the given starting puzzle and a difficulty.
     pub fn generate<H: HashFunction>(puzzle: &[u8], difficulty: usize, h: H) -> Self {
         Self::generate_with_progress(puzzle, difficulty, |_| (), h)
     }
-
     /// Generate with progress. The callback is called every time progress is made with a floating point number from 0 to 1.
     pub fn generate_with_progress<H: HashFunction>(
         puzzle: &[u8],
