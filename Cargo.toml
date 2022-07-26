@@ -14,3 +14,8 @@ rustc-hash = "1.1.0"
 smallvec = {version = "1.8.0", features=["const_generics", "union"]}
 tmelcrypt = "0.2.4"
 blake3 = "1.3.1"
+
+bincode = "1.3.3"
+serde = "1.0.140"
+anyhow = "1.0.58"
+
