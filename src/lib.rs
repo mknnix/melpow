@@ -8,24 +8,23 @@ pub use crate::node::SVec;
 pub use hash::HashFunction;
 
 use std::{convert::TryInto, sync::Arc, time::Instant};
-
 use rustc_hash::FxHashMap;
 
-use {bincode, serde};
+use bincode;
 use serde::{Serialize, Deserialize};
 use anyhow;
 
 const PROOF_CERTAINTY: usize = 200;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// A MelPoW proof with an opaque representation that is guaranteed to be stable. It can be cloned relatively cheaply because it's internally reference counted.
-pub struct Proof(Arc<FxHashMap<node::Node, SVec<u8>>>);
+pub struct Proof(Arc<FxHashMap< node::Node, SVec<u8> >>);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
-pub struct ProofUnderProgress
+pub struct ProofUnderProgress<HF: HashFunction>
 {
-    proof_map: Arc<FxHashMap< node::Node, SVec<u8> >>,
+    proof_map: FxHashMap< node::Node, SVec<u8> >,
     chi: SVec<u8>,
     gammas: Vec<node::Node>,
     total_count: f64,
@@ -36,20 +35,20 @@ pub struct ProofUnderProgress
     puzzle: Vec<u8>,
     difficulty: usize,
 
-    TICK_SECS: usize, // const in the lifetime of a instance, do not modify it once constructed.
-    tick_secs_override: Option<usize>,
+    TICK_SECS: u64, // const in the lifetime of a instance, do not modify it once constructed.
+    tick_secs_override: Option<u64>,
     ticks: u64, // a tick counter
 
     finish: bool,
     proof: Option<Proof>,
 
-    hasher: HashFunction,
+    //hasher: Box<dyn HashFunction>,
 }
 
-impl ProofUnderProgress {
+impl<HF: HashFunction> ProofUnderProgress<HF> {
     /// initial a new blank mint progress.
-    pub fn init(puzzle: &[u8], difficulty: usize, hasher: impl HashFunction) -> Self {
-        let proof_map = Arc::new( FxHashMap::default() );
+    pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
+        let proof_map = FxHashMap::default();
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
@@ -64,7 +63,7 @@ impl ProofUnderProgress {
         let total_count = 2.0f64.powi(difficulty as _);
         let current_count = 0.0;
 
-        Self {
+        Self::<HF> {
             puzzle: puzzle.to_vec(),
             difficulty,
             proof_map,
@@ -72,7 +71,7 @@ impl ProofUnderProgress {
             gammas,
             total_count,
             current_count,
-            hasher,
+            //hasher: Box::new(hasher),
 
             TICK_SECS: Self::default_tick(),
             tick_secs_override: None,
@@ -104,6 +103,18 @@ impl ProofUnderProgress {
         None
     }
 
+    /// get the percentage of current progress...
+    pub fn current_percentage(&self) -> Option<f64> {
+        Some( 100.0 * self.current_radio()? )
+    }
+    pub fn current_radio(&self) -> Option<f64> {
+        if self.current_count <= 0.0 || self.total_count <= 0.0 {
+            return None;
+        }
+
+        Some(self.current_count / self.total_count)
+    }
+
     /// the core handle function for the progress of generating proof. do not pub it unless you expect others to violate the tick interval.
     /// the number of executes is fixed to 100,000 ops (unless it will be returned earlier when the progress completed)
     /// ** make sure the .finish field only set by this function **
@@ -127,10 +138,10 @@ impl ProofUnderProgress {
     }
 
     /// default tick value is read-only for everyone (don't modify unless you have a good idea)
-    pub fn default_tick() -> usize { 30 }
+    pub fn default_tick() -> u64 { 30 }
 
     /// get the time-split interval, return the default value if no any override
-    pub fn get_tick(&self) -> usize {
+    pub fn get_tick(&self) -> u64 {
         if let Some(tick) = self.tick_secs_override {
             return tick;
         }
@@ -138,7 +149,7 @@ impl ProofUnderProgress {
         self.TICK_SECS
     }
     /// specify a tick value to replace the default... returns True if success
-    pub fn override_tick(&mut self, tick: usize) -> bool {
+    pub fn override_tick(&mut self, tick: u64) -> bool {
         // refused to override again
         if let Some(_) = self.tick_secs_override {
             return false;
@@ -263,7 +274,6 @@ impl Proof {
 
         output
     }
-
     /// Deserializes a proof from a byte vector.
     pub fn from_bytes(mut bts: &[u8]) -> Option<Self> {
         let unit_size = 8 + 32;

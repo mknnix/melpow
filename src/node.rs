@@ -2,12 +2,14 @@ use crate::hash::{self, HashFunction};
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use serde::{Serialize, Deserialize};
+
 use std::convert::TryInto;
 use std::fmt;
 
 pub type SVec<T> = SmallVec<[T; 40]>;
 
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct Node {
     pub bv: u64,
     pub len: usize,
