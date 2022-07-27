@@ -1,5 +1,4 @@
 use std::ops::Deref;
-
 use crate::node::SVec;
 
 /// A raw hash function. For convenience, this trait is implemented also for closures.

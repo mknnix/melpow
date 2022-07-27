@@ -22,8 +22,7 @@ pub struct Proof(Arc<FxHashMap< node::Node, SVec<u8> >>);
 
 #[derive(Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
-pub struct ProofUnderProgress<HF: HashFunction+Sized>
-{
+pub struct ProofUnderProgress {
     proof_map: FxHashMap< node::Node, SVec<u8> >,
     chi: SVec<u8>,
     gammas: Vec<node::Node>,
@@ -42,20 +41,23 @@ pub struct ProofUnderProgress<HF: HashFunction+Sized>
     finish: bool,
     proof: Option<Proof>,
 
-    hasher: Box<HF>,
+    /*#[serde(default = "None")]
+    #[default = "None"]
+    h: Option<Box<dyn HashFunction>>
+    */
 }
 
-impl<HF: HashFunction+Sized> ProofUnderProgress<HF> {
-    /// initial a new blank mint progress.
-    pub fn init(puzzle: &[u8], difficulty: usize, h: HF) -> Self {
+impl ProofUnderProgress {
+    /// initial a blank progress for new proof. but without hash function set, you need to give it for each call to self.next
+    pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
         let mut proof_map = FxHashMap::default();
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
         for gamma in gammas.clone() {
-            gamma_to_path(gamma).into_iter().for_each(|pn| {
+            for pn in gamma_to_path(gamma) {
                 proof_map.insert(pn, SVec::new());
-            });
+            }
 
             proof_map.insert(gamma, SVec::new());
         }
@@ -71,7 +73,7 @@ impl<HF: HashFunction+Sized> ProofUnderProgress<HF> {
             gammas,
             total_count,
             current_count,
-            hasher: Box::new(h),
+            //h: None,
 
             TICK_SECS: Self::default_tick(),
             tick_secs_override: None,
@@ -83,25 +85,40 @@ impl<HF: HashFunction+Sized> ProofUnderProgress<HF> {
         }
     }
 
-    // to execute next generating until $tick seconds later.
-    // if finish, return a Proof object, or None
-    pub fn next(&mut self) -> Option<Proof> {
-        if self.finish {
-            return Some( self.generate_proof() );
-        }
+    /// save the snapshot of generating status into a byte array.
+    pub fn save(&self) -> anyhow::Result<Vec<u8>> {
+        Ok( bincode::serialize(self)? )
+    }
+    /// recovering the snapshot from a byte array. (Notice: this operation will return a new instance with the state)
+    pub fn recovery_from(data: &[u8]) -> anyhow::Result<Self> {
+        return Ok( bincode::deserialize(data)? );
+        /*
+        let mut snapshot = bincode::deserialize(data)?;
+        snapshot.h = Some(Box::new(h));
+        Ok(snapshot)
+        */
+    }
 
+    /// to execute next generating until $tick seconds later.
+    /// if finish, return a Proof object, or None
+    /// ** make sure the .ticks field only add by this function **
+    pub fn next(&mut self, h: impl HashFunction) -> Option<Proof> {
         let start = Instant::now();
         let tick = self.get_tick();
-        while start.elapsed().as_secs() < tick {
-            self.do_progressing();
-            if self.finish { break; }
+
+        while ! self.finish {
+            if start.elapsed().as_secs() > tick {
+                return None;
+            }
+
+            self.do_progressing(&h);
+            self.ticks += 1;
         }
-        self.ticks += 1;
 
-        if self.finish { return self.next(); }
-
-        None
+        Some( self.generate_proof() )
     }
+    /// read(only) the current tick number, the tick-number is add one for each tick.
+    pub fn current_tick(&self) -> u64 { self.ticks }
 
     /// get the percentage of current progress...
     pub fn current_percentage(&self) -> Option<f64> {
@@ -116,9 +133,9 @@ impl<HF: HashFunction+Sized> ProofUnderProgress<HF> {
     }
 
     /// the core handle function for the progress of generating proof. do not pub it unless you expect others to violate the tick interval.
-    /// the number of executes is fixed to 100,000 ops (unless it will be returned earlier when the progress completed)
+    /// the number of executes is fixed to 100,000 hashes (unless it will be returned earlier when the progress completed)
     /// ** make sure the .finish field only set by this function **
-    fn do_progressing(&mut self) {
+    fn do_progressing(&mut self, h: impl HashFunction) {
         todo!()
     }
     /// generate the proof. this method should be call with The Final State, otherwise it will got you an unwanted result
