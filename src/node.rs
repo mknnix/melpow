@@ -3,7 +3,6 @@ use crate::hash::{self, HashFunction};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use serde::{Serialize, Deserialize};
-
 use std::convert::TryInto;
 use std::fmt;
 
@@ -96,19 +95,13 @@ impl fmt::Display for Node {
 
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = {
-            if self.len == 0 {
-                String::from("ε")
-            } else {
-                (0..self.len)
-                    .map(|i| if (self.bv >> i) & 1 != 0 { '1' } else { '0' })
-                    .collect()
-            }
-        };
+        let str = format!("{}", self);
         write!(f, "{}", str)
     }
 }
 
+/// un-comment next line if scheduled to deprecating this un-interruptable function...
+//#[deprecated(since="0.3.0", note="recommended use `ProofUnderProgress` instead")]
 pub fn calc_labels<H: HashFunction>(chi: &[u8], n: usize, f: &mut impl FnMut(Node, &[u8]), h: H) {
     calc_labels_helper(chi, n, Node::new_zero(), f, &mut FxHashMap::default(), &h);
     // // iterative implementation

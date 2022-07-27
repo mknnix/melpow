@@ -16,20 +16,29 @@ use anyhow;
 
 const PROOF_CERTAINTY: usize = 200;
 
+type ProofMap = Arc<FxHashMap< node::Node, SVec<u8> >>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// A MelPoW proof with an opaque representation that is guaranteed to be stable. It can be cloned relatively cheaply because it's internally reference counted.
-pub struct Proof(Arc<FxHashMap< node::Node, SVec<u8> >>);
+pub struct Proof(ProofMap);
 
+#[allow(non_snake_case)]
 #[derive(Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
 pub struct ProofUnderProgress {
-    proof_map: FxHashMap< node::Node, SVec<u8> >,
+    proof_map: ProofMap,
     chi: SVec<u8>,
     gammas: Vec<node::Node>,
+
     total_count: f64,
     current_count: f64,
-    //nd: 'unk',
-    //lab: 'unk',
+
+    nd: node::Node,
+    n: usize,
+    lab: SVec<u8>,
+
+    l0: SVec<u8>, l1: SVec<u8>,
+    nd0: node::Node, nd1: node::Node,
 
     puzzle: Vec<u8>,
     difficulty: usize,
@@ -50,37 +59,48 @@ pub struct ProofUnderProgress {
 impl ProofUnderProgress {
     /// initial a blank progress for new proof. but without hash function set, you need to give it for each call to self.next
     pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
-        let mut proof_map = FxHashMap::default();
+        let mut proof_map = Arc::new(FxHashMap::default());
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
+        let proof_map_mut = Arc::make_mut(&mut proof_map);
         for gamma in gammas.clone() {
             for pn in gamma_to_path(gamma) {
-                proof_map.insert(pn, SVec::new());
+                proof_map_mut.insert(pn, SVec::new());
             }
 
-            proof_map.insert(gamma, SVec::new());
+            proof_map_mut.insert(gamma, SVec::new());
         }
 
         let total_count = 2.0f64.powi(difficulty as _);
         let current_count = 0.0;
 
+        let ndz = node::Node::new_zero();
+        let svecz = SVec::new();
+
         Self {
-            puzzle: puzzle.to_vec(),
-            difficulty,
             proof_map,
             chi,
             gammas,
+
             total_count,
             current_count,
-            //h: None,
+
+            nd: ndz,
+            n: 0,
+            lab: svecz.clone(),
+
+            l0: svecz.clone(), l1: svecz.clone(),
+            nd0: ndz, nd1: ndz,
+
+            puzzle: puzzle.to_vec(),
+            difficulty,
 
             TICK_SECS: Self::default_tick(),
             tick_secs_override: None,
-
-            finish: false,
             ticks: 0,
 
+            finish: false,
             proof: None,
         }
     }
@@ -119,6 +139,8 @@ impl ProofUnderProgress {
     }
     /// read(only) the current tick number, the tick-number is add one for each tick.
     pub fn current_tick(&self) -> u64 { self.ticks }
+    /// read(only) the current elapsed seconds, This result may be inaccurate if the tick interval has changed in the middle
+    pub fn elapsed_secs(&self) -> u64 { self.ticks * self.get_tick() }
 
     /// get the percentage of current progress...
     pub fn current_percentage(&self) -> Option<f64> {
@@ -133,10 +155,64 @@ impl ProofUnderProgress {
     }
 
     /// the core handle function for the progress of generating proof. do not pub it unless you expect others to violate the tick interval.
-    /// the number of executes is fixed to 100,000 hashes (unless it will be returned earlier when the progress completed)
-    /// ** make sure the .finish field only set by this function **
+    /// the number of executes is fixed to 10,000 hashes (unless it will be returned earlier when the progress completed)
+    /// ** make sure the .finish and .current_count field only modified by this function **
     fn do_progressing(&mut self, h: impl HashFunction) {
-        todo!()
+        if self.finish { return; }
+
+        const OPS: usize = 10_000;
+
+        let chi = &self.chi;
+        let ell = Arc::make_mut(&mut self.proof_map);
+
+        for _ in 0..OPS {
+            if self.finish { return; }
+
+            if self.nd.len == self.n {
+                self.lab = {
+                    let mut lab_gen = hash::Accumulator::new(chi, &h);
+                    lab_gen.add(&self.nd.to_bytes());
+                    self.nd.foreach_parent(self.n, |parent| {
+                        lab_gen.add(&ell[&parent]);
+                    });
+                    lab_gen.hash()
+                };
+
+                // completing the progress... (possible mis-understanding?)
+                self.finish = true;
+            } else {
+                // left tree
+                self.l0 = {
+                    let mut lab_gen = hash::Accumulator::new(chi, &h);
+                    lab_gen.add(&self.nd.append(0).to_bytes());
+                    self.nd.foreach_parent(self.n, |parent| {
+                        lab_gen.add(&ell[&parent]);
+                    });
+                    lab_gen.hash()
+                };
+                ell.insert(self.nd.append(0), self.l0.clone());
+
+                // right tree
+                self.l1 = {
+                    let mut lab_gen = hash::Accumulator::new(chi, &h);
+                    lab_gen.add(&self.nd.append(1).to_bytes());
+                    self.nd.foreach_parent(self.n, |parent| {
+                        lab_gen.add(&ell[&parent]);
+                    });
+                    lab_gen.hash()
+                };
+                ell.remove(&self.nd.append(0));
+
+                // calculate label
+                self.lab = hash::Accumulator::new(chi, &h)
+                    .add(&self.nd.to_bytes())
+                    .add(&self.l0)
+                    .add(&self.l1)
+                    .hash();
+            }
+
+            self.current_count += 1.0;
+        }
     }
     /// generate the proof. this method should be call with The Final State, otherwise it will got you an unwanted result
     pub fn generate_proof(&mut self) -> Proof {
@@ -147,7 +223,7 @@ impl ProofUnderProgress {
             return proof.clone();
         }
 
-        let proof = todo!();
+        let proof = Proof( self.proof_map.clone().into() );
 
         self.proof = Some(proof);
         self.generate_proof()
@@ -168,6 +244,10 @@ impl ProofUnderProgress {
     pub fn override_tick(&mut self, tick: u64) -> bool {
         // refused to override again
         if let Some(_) = self.tick_secs_override {
+            return false;
+        }
+        // refused to override if in progressing
+        if self.ticks > 0 {
             return false;
         }
 
