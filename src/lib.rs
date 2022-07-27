@@ -22,7 +22,7 @@ pub struct Proof(Arc<FxHashMap< node::Node, SVec<u8> >>);
 
 #[derive(Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
-pub struct ProofUnderProgress<HF: HashFunction>
+pub struct ProofUnderProgress<HF: HashFunction+Sized>
 {
     proof_map: FxHashMap< node::Node, SVec<u8> >,
     chi: SVec<u8>,
@@ -42,28 +42,28 @@ pub struct ProofUnderProgress<HF: HashFunction>
     finish: bool,
     proof: Option<Proof>,
 
-    //hasher: Box<dyn HashFunction>,
+    hasher: Box<HF>,
 }
 
-impl<HF: HashFunction> ProofUnderProgress<HF> {
+impl<HF: HashFunction+Sized> ProofUnderProgress<HF> {
     /// initial a new blank mint progress.
-    pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
-        let proof_map = FxHashMap::default();
+    pub fn init(puzzle: &[u8], difficulty: usize, h: HF) -> Self {
+        let mut proof_map = FxHashMap::default();
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
-        gammas.into_iter().for_each(|gamma| {
+        for gamma in gammas.clone() {
             gamma_to_path(gamma).into_iter().for_each(|pn| {
                 proof_map.insert(pn, SVec::new());
             });
 
             proof_map.insert(gamma, SVec::new());
-        });
+        }
 
         let total_count = 2.0f64.powi(difficulty as _);
         let current_count = 0.0;
 
-        Self::<HF> {
+        Self {
             puzzle: puzzle.to_vec(),
             difficulty,
             proof_map,
@@ -71,7 +71,7 @@ impl<HF: HashFunction> ProofUnderProgress<HF> {
             gammas,
             total_count,
             current_count,
-            //hasher: Box::new(hasher),
+            hasher: Box::new(h),
 
             TICK_SECS: Self::default_tick(),
             tick_secs_override: None,
@@ -126,15 +126,14 @@ impl<HF: HashFunction> ProofUnderProgress<HF> {
         if ! self.finish {
             panic!("do not call this with still in progressing...");
         }
-
-        if let Some(proof) = self.proof {
-            return proof;
+        if let Some(proof) = &self.proof {
+            return proof.clone();
         }
 
         let proof = todo!();
 
         self.proof = Some(proof);
-        proof
+        self.generate_proof()
     }
 
     /// default tick value is read-only for everyone (don't modify unless you have a good idea)
