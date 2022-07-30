@@ -1,5 +1,5 @@
 use crate::hash::{self, HashFunction};
-use crate::ProofMap;
+use crate::{ProofMap, ProofUnderProgress};
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -102,7 +102,7 @@ impl fmt::Debug for Node {
 }
 
 pub fn calc_labels<H: HashFunction>(chi: &[u8], n: usize, f: &mut impl FnMut(Node, &[u8]), h: H) {
-    calc_labels_helper(chi, n, Node::new_zero(), f, &mut FxHashMap::default(), &h);
+    calc_all_labels_helper(chi, n, Node::new_zero(), f, &mut FxHashMap::default(), &h);
     // // iterative implementation
     // let mut memoizer: FxHashMap<Node, SVec<u8>> = FxHashMap::default();
     // // let mut memoizer: Vec<(Node, SVec<u8>)> = Default::default();
@@ -146,7 +146,7 @@ pub fn calc_labels<H: HashFunction>(chi: &[u8], n: usize, f: &mut impl FnMut(Nod
 }
 
 #[inline]
-fn calc_labels_helper<H: HashFunction>(
+fn calc_all_labels_helper<H: HashFunction>(
     chi: &[u8],
     n: usize,
     nd: Node,
@@ -166,10 +166,10 @@ fn calc_labels_helper<H: HashFunction>(
         lab
     } else {
         // left tree
-        let l0 = calc_labels_helper(chi, n, nd.append(0), f, ell, hasher);
+        let l0 = calc_all_labels_helper(chi, n, nd.append(0), f, ell, hasher);
         ell.insert(nd.append(0), l0.clone());
         // right tree
-        let l1 = calc_labels_helper(chi, n, nd.append(1), f, ell, hasher);
+        let l1 = calc_all_labels_helper(chi, n, nd.append(1), f, ell, hasher);
         ell.remove(&nd.append(0));
         // calculate label
         let lab = hash::Accumulator::new(chi, hasher)
@@ -180,6 +180,66 @@ fn calc_labels_helper<H: HashFunction>(
         f(nd, &lab);
         lab
     }
+}
+
+#[inline]
+pub fn calc_labels_helper<H: HashFunction>(
+    chi: &[u8],
+    n: usize,
+    nd: Node,
+    f: &mut impl FnMut(&mut ProofUnderProgress),
+    state: &mut ProofUnderProgress,
+    hasher: &H,
+) {
+    let chi = state.chi.clone();
+    let n = state.difficulty;
+    let nd = state.nd;
+
+    // // iterative implementation
+    let mut stack = Vec::with_capacity(32);
+    stack.push((false, nd));
+    while let Some((revisit, nd)) = stack.pop() {
+        // eprintln!(
+        //     "visiting {} at stack size {} and memoizer size {} ",
+        //     nd,
+        //     stack.len(),
+        //     memoizer.len()
+        // );
+        if nd.len == n {
+            let mut lab_gen = hash::Accumulator::new(&chi, hasher);
+            lab_gen.add(&nd.to_bytes());
+            nd.foreach_parent(n, |parent| {
+                lab_gen.add(state.proof_map.get(&parent).unwrap());
+            });
+            
+            let lab = lab_gen.hash();
+            state.proof_map.insert(nd, lab);
+
+            state.nd = nd;
+            state.current_count += 1.0;
+
+            f(state);
+        } else if !revisit {
+            stack.push((true, nd));
+            stack.push((false, nd.append(1)));
+            stack.push((false, nd.append(0)));
+        } else {
+            let l0 = state.proof_map[&nd.append(0)].clone();
+            let l1 = state.proof_map[&nd.append(1)].clone();
+            state.proof_map.remove(&nd.append(0));
+            state.proof_map.remove(&nd.append(1));
+
+            let lab = hash::Accumulator::new(&chi, hasher)
+                .add(&nd.to_bytes())
+                .add(&l0)
+                .add(&l1)
+                .hash();
+
+            state.nd = nd;
+            state.proof_map.insert(nd, lab);
+            f(state);
+        }
+   }
 }
 
 #[cfg(test)]
