@@ -1,13 +1,15 @@
 use crate::hash::{self, HashFunction};
+use crate::ProofMap;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use serde::{Serialize, Deserialize};
 use std::convert::TryInto;
 use std::fmt;
 
 pub type SVec<T> = SmallVec<[T; 40]>;
 
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct Node {
     pub bv: u64,
     pub len: usize,
@@ -94,15 +96,7 @@ impl fmt::Display for Node {
 
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = {
-            if self.len == 0 {
-                String::from("ε")
-            } else {
-                (0..self.len)
-                    .map(|i| if (self.bv >> i) & 1 != 0 { '1' } else { '0' })
-                    .collect()
-            }
-        };
+        let str = format!("{}", self);
         write!(f, "{}", str)
     }
 }
@@ -157,7 +151,7 @@ fn calc_labels_helper<H: HashFunction>(
     n: usize,
     nd: Node,
     f: &mut impl FnMut(Node, &[u8]),
-    ell: &mut FxHashMap<Node, SVec<u8>>,
+    ell: &mut ProofMap,
     hasher: &H,
 ) -> SVec<u8> {
     if nd.len == n {
