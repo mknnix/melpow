@@ -2,7 +2,7 @@ use std::ops::Deref;
 use crate::node::SVec;
 
 /// A raw hash function. For convenience, this trait is implemented also for closures.
-pub trait HashFunction {
+pub trait HashFunction: std::marker::Sync {
     /// Hashes a bunch of bytes, with a given key.
     fn hash(&self, b: &[u8], k: &[u8]) -> SVec<u8>;
 }

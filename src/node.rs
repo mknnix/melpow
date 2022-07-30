@@ -1,11 +1,14 @@
 use crate::hash::{self, HashFunction};
-use crate::{ProofMap, ProofUnderProgress};
+use crate::{ArcProofMap, ProofMap, ProofUnderProgress};
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use serde::{Serialize, Deserialize};
 use std::convert::TryInto;
 use std::fmt;
+
+use smol::channel::{Sender, Receiver};
+use async_recursion::async_recursion;
 
 pub type SVec<T> = SmallVec<[T; 40]>;
 
@@ -154,6 +157,7 @@ fn calc_all_labels_helper<H: HashFunction>(
     ell: &mut ProofMap,
     hasher: &H,
 ) -> SVec<u8> {
+    // READ ONLY
     if nd.len == n {
         let mut lab_gen = hash::Accumulator::new(chi, hasher);
         lab_gen.add(&nd.to_bytes());
@@ -183,63 +187,58 @@ fn calc_all_labels_helper<H: HashFunction>(
 }
 
 #[inline]
-pub fn calc_labels_helper<H: HashFunction>(
+#[async_recursion]
+pub async fn calc_labels_helper<H: HashFunction>(
     chi: &[u8],
     n: usize,
     nd: Node,
-    f: &mut impl FnMut(&mut ProofUnderProgress),
-    state: &mut ProofUnderProgress,
+    info_send: Sender<(Node, SVec<u8>)>,
+    map_recv: Receiver<&'async_recursion mut ProofMap>,
     hasher: &H,
-) {
-    let chi = state.chi.clone();
-    let n = state.difficulty;
-    let nd = state.nd;
+) -> SVec<u8> {
+    let mut ell = map_recv.recv().await.unwrap();
 
-    // // iterative implementation
-    let mut stack = Vec::with_capacity(32);
-    stack.push((false, nd));
-    while let Some((revisit, nd)) = stack.pop() {
-        // eprintln!(
-        //     "visiting {} at stack size {} and memoizer size {} ",
-        //     nd,
-        //     stack.len(),
-        //     memoizer.len()
-        // );
-        if nd.len == n {
-            let mut lab_gen = hash::Accumulator::new(&chi, hasher);
-            lab_gen.add(&nd.to_bytes());
-            nd.foreach_parent(n, |parent| {
-                lab_gen.add(state.proof_map.get(&parent).unwrap());
-            });
-            
-            let lab = lab_gen.hash();
-            state.proof_map.insert(nd, lab);
+    /////
+    let lab = if nd.len == n {
+        let mut lab_gen = hash::Accumulator::new(chi, hasher);
 
-            state.nd = nd;
-            state.current_count += 1.0;
+        lab_gen.add(&nd.to_bytes());
+        nd.foreach_parent(n, |parent| {
+            lab_gen.add(&ell[&parent]);
+        });
 
-            f(state);
-        } else if !revisit {
-            stack.push((true, nd));
-            stack.push((false, nd.append(1)));
-            stack.push((false, nd.append(0)));
-        } else {
-            let l0 = state.proof_map[&nd.append(0)].clone();
-            let l1 = state.proof_map[&nd.append(1)].clone();
-            state.proof_map.remove(&nd.append(0));
-            state.proof_map.remove(&nd.append(1));
-
-            let lab = hash::Accumulator::new(&chi, hasher)
-                .add(&nd.to_bytes())
-                .add(&l0)
-                .add(&l1)
-                .hash();
-
-            state.nd = nd;
-            state.proof_map.insert(nd, lab);
-            f(state);
+        let lab = lab_gen.hash();
+        if ell.get(&nd).is_some() || nd.len == 0 {
+            ell.insert(nd, lab.clone());
         }
-   }
+
+        info_send.send((nd, lab.clone())).await;
+        lab
+    } else {
+        // left tree
+        let l0 = calc_labels_helper(chi, n, nd.append(0), info_send, map_recv, hasher).await;
+        ell.insert(nd.append(0), l0.clone());
+
+        // right tree
+        let l1 = calc_labels_helper(chi, n, nd.append(1), info_send, map_recv, hasher).await;
+        ell.remove(&nd.append(0));
+
+        // calculate label
+        let lab = hash::Accumulator::new(chi, hasher)
+            .add(&nd.to_bytes())
+            .add(&l0)
+            .add(&l1)
+            .hash();
+
+        if ell.get(&nd).is_some() || nd.len == 0 {
+            ell.insert(nd, lab.clone());
+        }
+
+        info_send.send((nd, lab.clone())).await;
+        lab
+    };
+
+    lab
 }
 
 #[cfg(test)]

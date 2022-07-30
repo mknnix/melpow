@@ -19,3 +19,6 @@ bincode = "1.3.3"
 serde = {version="1.0.137", features=["rc"]}
 anyhow = "1.0.57"
 
+smol = "1.2.5"
+async-recursion = "1.0.0"
+

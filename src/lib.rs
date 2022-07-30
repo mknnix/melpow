@@ -4,11 +4,14 @@
 
 mod hash;
 mod node;
-pub use crate::node::SVec;
+pub use crate::node::{Node, SVec};
 pub use hash::HashFunction;
 
-use std::{convert::TryInto, sync::Arc, time::Instant};
+use std::{convert::TryInto, sync::Arc, time::{Duration, Instant}};
 use rustc_hash::FxHashMap;
+
+use smol;
+//use smol::prelude::*;
 
 use bincode;
 use serde::{Serialize, Deserialize};
@@ -16,7 +19,7 @@ use anyhow;
 
 const PROOF_CERTAINTY: usize = 200;
 
-type ProofMap = FxHashMap< node::Node, SVec<u8> >;
+type ProofMap = FxHashMap<Node, SVec<u8>>;
 type ArcProofMap = Arc<ProofMap>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,7 +30,7 @@ pub struct Proof(ArcProofMap);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
 pub struct ProofUnderProgress {
-    proof_map: ProofMap,
+    proof_map: ArcProofMap,
     chi: SVec<u8>,
     //gammas: Vec<node::Node>,
 
@@ -44,13 +47,14 @@ pub struct ProofUnderProgress {
 
     progressing: bool,
     finish: bool,
-    proof: Option<Proof>
+    proof: Option<Proof>,
+
 }
 
 impl ProofUnderProgress {
     /// initial a blank progress for new proof. but without hash function set, you need to give it for each call to self.next
     pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
-        let mut proof_map = FxHashMap::default();
+        let mut proof_map = Arc::new(FxHashMap::default());
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
@@ -117,42 +121,64 @@ impl ProofUnderProgress {
     /// the core handle function for the progress of generating proof.
     /// if the progress callback given, call for give the clone of current status.
     /// ** make sure the .finish and .current_count field only modified by this function **
-    pub fn do_progressing<H: HashFunction>(&mut self, callback: &mut impl FnMut(Self), h: H) {
+    pub async fn do_progressing<H: HashFunction>(&mut self, saving: smol::channel::Sender<Self>, h: H) {
         if self.finish { return; }
 
         // assert only one do_progressing exists.
         assert!(self.progressing == false);
         self.progressing = true;
 
+        let chi = self.chi.clone();
+
         let mut time = Instant::now();
         let tick = self.get_tick();
+        //let tick = Duration::from_secs(tick);
 
-        node::calc_labels_helper(
-            &self.chi.clone(),
+        let map_ch = smol::channel::bounded(1);
+        let info_ch = smol::channel::bounded(1);
+
+        let (map_send, map_recv) = map_ch;
+        let (info_send, info_recv) = info_ch;
+
+        let calcing = node::calc_labels_helper(
+            &chi,
             self.difficulty,
             self.nd,
-            &mut |state| {
-                /*
-                if nd.len == self.difficulty {
-                    self.current_count += 1.0;
-                }*/
+            info_send,
+            map_recv,
+            &h,
+        );
 
-                /*
-                if map.get(&nd).is_some() || nd.len == 0 {
-                    map.insert(nd, SVec::from_slice(lab));
+        smol::future::race(calcing, async {
+            let mut proof_map = Arc::make_mut(&'async_recursion mut self.proof_map);
+
+            loop {
+                map_send.send(proof_map).await;
+
+                {
+                    let (nd, lab) = info_recv.recv().await.unwrap();
+
+                    if nd.len == self.difficulty {
+                        self.current_count += 1.0;
+                        //on_progress(current_count / total_count);
+                    }
+                    if proof_map.get(&nd).is_some() || nd.len == 0 {
+                        proof_map.insert(nd, lab);
+                    }
+
+                    if let Some(radio) = self.current_radio() {
+                        if radio >= 1.0 {
+                            self.finish = true;
+                        }
+                    }
                 }
-                */
 
                 if time.elapsed().as_secs() >= tick {
                     time = Instant::now();
-                    callback(state.clone());
+                    saving.send(self.clone()).await;
                 }
-            },
-            self,
-            &h
-        );
-
-        self.finish = true;
+            }
+        }).await;
     }
     /// generate the proof. this method should be call with The Final State, otherwise it will got you an unwanted result
     pub fn generate_proof(&mut self) -> Proof {
@@ -163,7 +189,7 @@ impl ProofUnderProgress {
             return proof.clone();
         }
 
-        let proof = Proof( Arc::new(self.proof_map.clone()) );
+        let proof = Proof( self.proof_map.clone() );
 
         self.proof = Some(proof);
         self.generate_proof()
