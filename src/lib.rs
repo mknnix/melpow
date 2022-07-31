@@ -30,7 +30,7 @@ pub struct Proof(ArcProofMap);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Represents a proof generating in progress, it will return a Proof if the work has completed
 pub struct ProofUnderProgress {
-    proof_map: ArcProofMap,
+    proof_map: ProofMap,
     chi: SVec<u8>,
     //gammas: Vec<node::Node>,
 
@@ -42,8 +42,8 @@ pub struct ProofUnderProgress {
 
     nd: node::Node,
 
-    TICK_SECS: u64, // const in the lifetime of a instance, do not modify it once constructed.
-    tick_secs_override: Option<u64>,
+    TICK: Duration, // const in the lifetime of a instance, do not modify it once constructed.
+    tick_override: Option<Duration>,
 
     progressing: bool,
     finish: bool,
@@ -54,7 +54,7 @@ pub struct ProofUnderProgress {
 impl ProofUnderProgress {
     /// initial a blank progress for new proof. but without hash function set, you need to give it for each call to self.next
     pub fn init(puzzle: &[u8], difficulty: usize) -> Self {
-        let mut proof_map = Arc::new(FxHashMap::default());
+        let mut proof_map = FxHashMap::default();
         let chi = hash::bts_key(puzzle, b"chi");
 
         let gammas = gen_gammas(puzzle, difficulty);
@@ -82,8 +82,8 @@ impl ProofUnderProgress {
 
             nd: node::Node::new_zero(),
 
-            TICK_SECS: Self::default_tick(),
-            tick_secs_override: None,
+            TICK: Self::default_tick(),
+            tick_override: None,
 
             progressing: false,
             finish: false,
@@ -121,7 +121,7 @@ impl ProofUnderProgress {
     /// the core handle function for the progress of generating proof.
     /// if the progress callback given, call for give the clone of current status.
     /// ** make sure the .finish and .current_count field only modified by this function **
-    pub async fn do_progressing<H: HashFunction>(&mut self, saving: smol::channel::Sender<Self>, h: H) {
+    pub async fn do_progressing<H: HashFunction>(&mut self, saving: &mut smol::channel::Sender<Self>, h: H) {
         if self.finish { return; }
 
         // assert only one do_progressing exists.
@@ -130,55 +130,22 @@ impl ProofUnderProgress {
 
         let chi = self.chi.clone();
 
-        let mut time = Instant::now();
+        let time = Instant::now();
         let tick = self.get_tick();
         //let tick = Duration::from_secs(tick);
 
-        let map_ch = smol::channel::bounded(1);
-        let info_ch = smol::channel::bounded(1);
-
-        let (map_send, map_recv) = map_ch;
-        let (info_send, info_recv) = info_ch;
-
-        let calcing = node::calc_labels_helper(
+        //let info_ch = smol::channel::unbounded();
+        //let (mut info_send, info_recv) = info_ch;
+        
+        node::calc_labels_helper(
+            (time, tick),
             &chi,
             self.difficulty,
             self.nd,
-            info_send,
-            map_recv,
+            saving,
+            self,
             &h,
-        );
-
-        smol::future::race(calcing, async {
-            let mut proof_map = Arc::make_mut(&'async_recursion mut self.proof_map);
-
-            loop {
-                map_send.send(proof_map).await;
-
-                {
-                    let (nd, lab) = info_recv.recv().await.unwrap();
-
-                    if nd.len == self.difficulty {
-                        self.current_count += 1.0;
-                        //on_progress(current_count / total_count);
-                    }
-                    if proof_map.get(&nd).is_some() || nd.len == 0 {
-                        proof_map.insert(nd, lab);
-                    }
-
-                    if let Some(radio) = self.current_radio() {
-                        if radio >= 1.0 {
-                            self.finish = true;
-                        }
-                    }
-                }
-
-                if time.elapsed().as_secs() >= tick {
-                    time = Instant::now();
-                    saving.send(self.clone()).await;
-                }
-            }
-        }).await;
+        ).await;
     }
     /// generate the proof. this method should be call with The Final State, otherwise it will got you an unwanted result
     pub fn generate_proof(&mut self) -> Proof {
@@ -189,27 +156,27 @@ impl ProofUnderProgress {
             return proof.clone();
         }
 
-        let proof = Proof( self.proof_map.clone() );
+        let proof = Proof( Arc::new(self.proof_map.clone()) );
 
         self.proof = Some(proof);
         self.generate_proof()
     }
 
     /// default tick value is read-only for everyone (don't modify unless you have a good idea)
-    pub fn default_tick() -> u64 { 30 }
+    pub fn default_tick() -> Duration { Duration::from_secs(30) }
 
     /// get the interval size, return the default value if no any override
-    pub fn get_tick(&self) -> u64 {
-        if let Some(tick) = self.tick_secs_override {
+    pub fn get_tick(&self) -> Duration {
+        if let Some(tick) = self.tick_override {
             return tick;
         }
-
-        self.TICK_SECS
+        
+        self.TICK
     }
     /// specify a tick value to replace the default... returns True if success
-    pub fn override_tick(&mut self, tick: u64) -> bool {
+    pub fn override_tick(&mut self, tick: Duration) -> bool {
         // refused to override again
-        if let Some(_) = self.tick_secs_override {
+        if let Some(_) = self.tick_override {
             return false;
         }
         // refused to override if in progressing
@@ -220,7 +187,7 @@ impl ProofUnderProgress {
         // cannot accept too small interval
         //assert!(tick >= 5);
 
-        self.tick_secs_override = Some(tick);
+        self.tick_override = Some(tick);
         return true;
     }
 }
@@ -385,7 +352,8 @@ fn gamma_to_path(gamma: node::Node) -> Vec<node::Node> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{HashFunction, Proof, ProofUnderProgress, SVec};
+    use smol_timeout::TimeoutExt;
+    use crate::{HashFunction, Proof, ProofUnderProgress, SVec, Duration};
 
     struct Hasher;
 
@@ -410,19 +378,26 @@ mod tests {
     }
 
     // RUST_BACKTRACE=full cargo test -v -- --nocapture
-    #[test]
-    fn test_interruptable() {
+    async fn test_pup() {
         let difficulty = 17;
         let puzzle = b"demopuzfortestonly".to_vec();
         println!("diff: {}, puz: {:?}", difficulty, puzzle);
 
         let mut pup = ProofUnderProgress::init(&puzzle, difficulty);
-        assert!(pup.override_tick(5));
+        assert!(pup.override_tick(Duration::from_secs(1)));
 
-        pup.do_progressing(&mut |state: ProofUnderProgress|{
-            println!("2nd PUP: tick={:?}|%={:?}", state.get_tick(), state.current_percentage());
-            println!("2nd PUP dumps: {:?}", state);
-        }, Hasher);
+        let (mut s, r) = smol::channel::unbounded();
+        smol::future::race(
+            pup.do_progressing(&mut s, Hasher),
+            smol::spawn(async move {
+                loop {
+                    let state = r.recv().await.unwrap();
+                    println!("2nd PUP: tick={:?}|%={:?}", state.get_tick(), state.current_percentage());
+                    println!("2nd PUP dumps: {:?}", state);
+                }
+            })
+        ).await;
+
         println!("2nd PUP proof completed");
         let proof_2nd = pup.generate_proof();
 
@@ -441,31 +416,35 @@ mod tests {
         assert_eq!(proof_2nd, proof_orig);
     }
 
-    //#[test]
-    fn test_recovery() {
+    async fn test_recovery() {
         let difficulty = 18;
         let puzzle = b"recovery".to_vec();
 
         let mut pup = ProofUnderProgress::init(&puzzle, difficulty);
-        assert!(pup.override_tick(1));
+        assert!(pup.override_tick(Duration::from_secs(1)));
 
-        let mut rec = None;
-        pup.do_progressing(&mut |state: ProofUnderProgress|{
-            if let None = rec {
-                rec = Some(state.save().unwrap());
-            }
+        let mut rec = vec![];
+        let (mut s, r) = smol::channel::bounded(1);
 
-        }, Hasher);
+        pup.do_progressing(&mut s, Hasher).timeout(Duration::from_secs(5)).await;
+        rec.push(r.recv().await.unwrap().save().unwrap().to_vec());
 
         let p1 = pup.generate_proof();
 
         // ===================================
 
-        let mut pup_rec = ProofUnderProgress::recovery_from(&rec.unwrap()).unwrap();
-        pup_rec.do_progressing(&mut |state: ProofUnderProgress|{
-            println!("recovered PUP: tick={:?}|%={:?}", state.get_tick(), state.current_percentage());
-            //println!("recovered PUP dumps: {:?}", state);
-        }, Hasher);
+        let mut pup_rec = ProofUnderProgress::recovery_from(&rec[0]).unwrap();
+        let (mut s, r) = smol::channel::unbounded();
+        smol::future::race(
+            pup.do_progressing(&mut s, Hasher),
+            smol::spawn(async move {
+                loop {
+                    let state = r.recv().await.unwrap();
+                    println!("2nd PUP: tick={:?}|%={:?}", state.get_tick(), state.current_percentage());
+                    println!("2nd PUP dumps: {:?}", state);
+                }
+            })
+        ).await;
 
         let p2 = pup_rec.generate_proof();
 
@@ -479,5 +458,10 @@ mod tests {
             assert_eq!(Proof::from_bytes(&proof.to_bytes()).unwrap(), proof);
 
         }
+    }
+
+    #[test]
+    fn test_interrupt() {
+        smol::block_on(smol::future::race(test_pup(), test_recovery()));
     }
 }

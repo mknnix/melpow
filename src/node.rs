@@ -9,6 +9,7 @@ use std::fmt;
 
 use smol::channel::{Sender, Receiver};
 use async_recursion::async_recursion;
+use std::time::{Instant, Duration};
 
 pub type SVec<T> = SmallVec<[T; 40]>;
 
@@ -189,39 +190,45 @@ fn calc_all_labels_helper<H: HashFunction>(
 #[inline]
 #[async_recursion]
 pub async fn calc_labels_helper<H: HashFunction>(
+    ticking: (Instant, Duration),
     chi: &[u8],
     n: usize,
     nd: Node,
-    info_send: Sender<(Node, SVec<u8>)>,
-    map_recv: Receiver<&'async_recursion mut ProofMap>,
+    info_send: &mut Sender<ProofUnderProgress>,
+    state: &'async_recursion mut ProofUnderProgress,
     hasher: &H,
 ) -> SVec<u8> {
-    let mut ell = map_recv.recv().await.unwrap();
+    let (mut started, tick) = ticking;
+    if started.elapsed() >= tick {
+        started = Instant::now();
+        info_send.send(state.clone()).await;
+    }
 
     /////
     let lab = if nd.len == n {
+        state.current_count += 1.0;
+
         let mut lab_gen = hash::Accumulator::new(chi, hasher);
 
         lab_gen.add(&nd.to_bytes());
         nd.foreach_parent(n, |parent| {
-            lab_gen.add(&ell[&parent]);
+            lab_gen.add(&state.proof_map[&parent]);
         });
 
         let lab = lab_gen.hash();
-        if ell.get(&nd).is_some() || nd.len == 0 {
-            ell.insert(nd, lab.clone());
+        if state.proof_map.get(&nd).is_some() || nd.len == 0 {
+            state.proof_map.insert(nd, lab.clone());
         }
 
-        info_send.send((nd, lab.clone())).await;
         lab
     } else {
         // left tree
-        let l0 = calc_labels_helper(chi, n, nd.append(0), info_send, map_recv, hasher).await;
-        ell.insert(nd.append(0), l0.clone());
+        let l0 = calc_labels_helper((started, tick), chi, n, nd.append(0), info_send, state, hasher).await;
+        state.proof_map.insert(nd.append(0), l0.clone());
 
         // right tree
-        let l1 = calc_labels_helper(chi, n, nd.append(1), info_send, map_recv, hasher).await;
-        ell.remove(&nd.append(0));
+        let l1 = calc_labels_helper((started, tick), chi, n, nd.append(1), info_send, state, hasher).await;
+        state.proof_map.remove(&nd.append(0));
 
         // calculate label
         let lab = hash::Accumulator::new(chi, hasher)
@@ -230,13 +237,20 @@ pub async fn calc_labels_helper<H: HashFunction>(
             .add(&l1)
             .hash();
 
-        if ell.get(&nd).is_some() || nd.len == 0 {
-            ell.insert(nd, lab.clone());
+        if state.proof_map.get(&nd).is_some() || nd.len == 0 {
+            state.proof_map.insert(nd, lab.clone());
         }
 
-        info_send.send((nd, lab.clone())).await;
+        state.nd = nd;
+
         lab
     };
+
+    if let Some(radio) = state.current_radio() {
+        if radio >= 1.0 {
+            state.finish = true;
+        }
+    }
 
     lab
 }
